@@ -15,6 +15,32 @@ from google.adk.plugins import base_plugin
 from core.utils import chat_with_agent
 
 
+def _secret_patterns() -> dict[str, str]:
+    """Return deterministic patterns for PII and the lab's protected values."""
+    patterns = {
+        "phone": r"(?<!\d)(?:0\d{9,10}|\+84\s?(?:3|5|7|8|9)\d{8})(?!\d)",
+        "email": r"(?<![\w.-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key": r"\bsk-[A-Za-z0-9_-]{8,}\b",
+        "api_key_assignment": r"(?:api[\s_-]*key|access[\s_-]*token|bearer)\s*(?:is\s*)?[:=]\s*\S+|(?:api[\s_-]*key|access[\s_-]*token)\s+is\s+\S+",
+        "password": r"(?:password|passwd|mật\s*khẩu)\s*(?:is\s*)?[:=]\s*\S+|(?:password|passwd|mật\s*khẩu)\s+is\s+\S+",
+        "db_host": r"\bdb\.vinbank\.internal(?::\d+)?\b",
+        "demo_password": r"\badmin123\b",
+    }
+
+    # Keep the filter aligned with the protected fixture if it changes, while
+    # retaining the explicit patterns above for predictable public behavior.
+    try:
+        from core.config import DEMO_SECRETS
+
+        for index, value in enumerate(DEMO_SECRETS):
+            if value and len(value) >= 6:
+                patterns[f"protected_value_{index}"] = re.escape(value)
+    except (ImportError, AttributeError):
+        pass
+    return patterns
+
+
 # ============================================================
 # Implement content_filter()
 #
@@ -37,20 +63,12 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    PII_PATTERNS = _secret_patterns()
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, response or "", re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -172,16 +190,36 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            try:
+                judge_result = await llm_safety_check(response_text)
+            except Exception:
+                # A safety judge failure must not release the original model
+                # response. Keep the already-redacted content and fail closed.
+                judge_result = {"safe": False, "verdict": "judge error"}
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot safely provide that response. "
+                                "Please ask a VinBank banking question."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
